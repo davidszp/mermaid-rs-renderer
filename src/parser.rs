@@ -4432,14 +4432,12 @@ fn parse_venn_diagram(input: &str) -> Result<ParseOutput> {
         }
         if let Some(rest) = venn_keyword(line, "text") {
             let mut cursor = VennCursor::new(rest);
-            let (mut sets, id) = if indented && current.is_some() {
-                (current.clone().unwrap_or_default(), cursor.text_id())
-            } else if indented {
-                bail!("text requires set: {line}");
-            } else {
-                (cursor.identifier_list(), cursor.text_id())
+            let mut sets = match (indented, &current) {
+                (true, Some(sets)) => sets.clone(),
+                (true, None) => bail!("text requires set: {line}"),
+                (false, _) => cursor.identifier_list(),
             };
-            let Some(id) = id else {
+            let Some(id) = cursor.text_id() else {
                 bail!("text requires an identifier: {line}")
             };
             let label = cursor.bracket_label();
@@ -4452,7 +4450,7 @@ fn parse_venn_diagram(input: &str) -> Result<ParseOutput> {
             let mut targets = cursor.identifier_list();
             targets.sort();
             let styles = cursor
-                .rest()
+                .rest
                 .split(',')
                 .filter_map(|field| {
                     let (key, value) = field.split_once(':')?;
@@ -4488,10 +4486,6 @@ impl<'a> VennCursor<'a> {
         Self {
             rest: rest.trim_start(),
         }
-    }
-
-    fn rest(&self) -> &'a str {
-        self.rest
     }
 
     /// A bare `[A-Za-z_][A-Za-z0-9_-]*` or a `"quoted string"`.
