@@ -413,6 +413,12 @@ pub fn render_svg_with_dimensions(
         return svg;
     }
 
+    if layout.kind == crate::ir::DiagramKind::Venn {
+        svg.push_str(&render_venn(layout, theme));
+        svg.push_str("</svg>");
+        return svg;
+    }
+
     if layout.kind == crate::ir::DiagramKind::Requirement {
         svg.push_str(&render_requirement(layout, theme, config));
         svg.push_str("</svg>");
@@ -2358,6 +2364,198 @@ fn render_error(layout: &ErrorLayout, _theme: &Theme, _config: &LayoutConfig) ->
     ));
     svg.push_str("</g>");
 
+    svg
+}
+
+/// mermaid.js's `venn1`…`venn8`, as its default, base and forest themes derive
+/// them: the primary, secondary and tertiary colours 30 points darker (the
+/// tertiary 40), then the primary and secondary turned by 60 and 120 degrees.
+/// On a dark background they are lightened instead, as the dark theme does. A
+/// colour that does not parse falls back to the pie palette.
+fn venn_palette(theme: &Theme, dark: bool) -> Vec<String> {
+    let adjust = |color: &str, dh: f32, dl: f32, fallback: usize| -> String {
+        match crate::theme::parse_color_to_hsl(color) {
+            Some((h, s, l)) => {
+                let l = if dark {
+                    (l - dl).clamp(0.0, 100.0)
+                } else {
+                    (l + dl).clamp(0.0, 100.0)
+                };
+                format!("hsl({:.1}, {s:.1}%, {l:.1}%)", (h + dh).rem_euclid(360.0))
+            }
+            None => theme.pie_colors[fallback % theme.pie_colors.len()].clone(),
+        }
+    };
+    let (p, s, t) = (
+        &theme.primary_color,
+        &theme.secondary_color,
+        &theme.tertiary_color,
+    );
+    vec![
+        adjust(p, 0.0, -30.0, 0),
+        adjust(s, 0.0, -30.0, 1),
+        adjust(t, 0.0, -40.0, 2),
+        adjust(p, 60.0, -30.0, 3),
+        adjust(p, -60.0, -30.0, 4),
+        adjust(s, 60.0, -30.0, 5),
+        adjust(p, 120.0, -30.0, 6),
+        adjust(s, 120.0, -30.0, 7),
+    ]
+}
+
+/// A Venn diagram, drawn as mermaid.js's default look draws it: each set a
+/// palette colour at 10% fill with a full-colour outline, its label in a
+/// darker shade of that colour (lighter on a dark background), union labels
+/// in the text colour, and a union filled only when a `style` gives it `fill`.
+fn render_venn(layout: &Layout, theme: &Theme) -> String {
+    use crate::layout::venn::{
+        LABEL_FONT_SIZE, STROKE_WIDTH, TEXT_FONT_SIZE, TITLE_FONT_SIZE, WIDTH,
+    };
+    let DiagramData::Venn(venn) = &layout.diagram else {
+        return String::new();
+    };
+    // `style` statements, later ones winning, keyed as mermaid.js keys them.
+    let style = |key: &str, prop: &str| -> Option<String> {
+        venn.styles
+            .iter()
+            .filter(|entry| entry.targets.join("|") == key)
+            .flat_map(|entry| entry.styles.iter())
+            .rfind(|(k, _)| k == prop)
+            .map(|(_, v)| v.clone())
+    };
+    let dark =
+        crate::theme::parse_color_to_hsl(&theme.background).is_some_and(|(_, _, l)| l < 50.0);
+    let shade = |color: &str| -> String {
+        match crate::theme::parse_color_to_hsl(color) {
+            Some((h, s, l)) => {
+                let l = if dark {
+                    (l + 30.0).min(100.0)
+                } else {
+                    (l - 30.0).max(0.0)
+                };
+                format!("hsl({h:.1}, {s:.1}%, {l:.1}%)")
+            }
+            None => theme.text_color.clone(),
+        }
+    };
+    let font = normalize_font_family(&theme.font_family);
+    let palette = venn_palette(theme, dark);
+    let base_of = |circle: &crate::layout::VennCircleLayout| -> String {
+        style(&circle.set, "fill")
+            .unwrap_or_else(|| palette[circle.color_index % palette.len()].clone())
+    };
+    let mut svg = String::new();
+
+    if let Some(title) = &venn.title {
+        svg.push_str(&format!(
+            "<text class=\"venn-title\" x=\"{:.3}\" y=\"{:.3}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>",
+            WIDTH / 2.0,
+            TITLE_FONT_SIZE,
+            font,
+            TITLE_FONT_SIZE,
+            escape_xml(&theme.text_color),
+            escape_xml(title)
+        ));
+    }
+
+    // Clip paths for the unions that are filled.
+    let filled: Vec<&Vec<String>> = venn
+        .unions
+        .iter()
+        .filter(|sets| style(&sets.join("|"), "fill").is_some())
+        .collect();
+    if !filled.is_empty() {
+        svg.push_str("<defs>");
+        for (idx, circle) in venn.circles.iter().enumerate() {
+            svg.push_str(&format!(
+                "<clipPath id=\"venn-clip-{idx}\"><circle cx=\"{:.3}\" cy=\"{:.3}\" r=\"{:.3}\" /></clipPath>",
+                circle.x, circle.y, circle.radius
+            ));
+        }
+        svg.push_str("</defs>");
+    }
+
+    for circle in &venn.circles {
+        let base = base_of(circle);
+        let opacity = style(&circle.set, "fill-opacity").unwrap_or_else(|| "0.1".into());
+        let stroke = style(&circle.set, "stroke").unwrap_or_else(|| base.clone());
+        let width = style(&circle.set, "stroke-width").unwrap_or_else(|| format!("{STROKE_WIDTH}"));
+        svg.push_str(&format!(
+            "<circle class=\"venn-circle\" cx=\"{:.3}\" cy=\"{:.3}\" r=\"{:.3}\" fill=\"{}\" fill-opacity=\"{}\" stroke=\"{}\" stroke-width=\"{}\" stroke-opacity=\"0.95\" />",
+            circle.x,
+            circle.y,
+            circle.radius,
+            escape_xml(&base),
+            escape_xml(&opacity),
+            escape_xml(&stroke),
+            escape_xml(&width)
+        ));
+    }
+
+    // A filled union: its last circle, clipped by each of the others.
+    for sets in filled {
+        let members: Vec<usize> = sets
+            .iter()
+            .filter_map(|id| venn.circles.iter().position(|c| &c.set == id))
+            .collect();
+        let Some((&last, rest)) = members.split_last() else {
+            continue;
+        };
+        let fill = style(&sets.join("|"), "fill").unwrap_or_default();
+        for idx in rest {
+            svg.push_str(&format!("<g clip-path=\"url(#venn-clip-{idx})\">"));
+        }
+        let c = &venn.circles[last];
+        svg.push_str(&format!(
+            "<circle class=\"venn-intersection\" cx=\"{:.3}\" cy=\"{:.3}\" r=\"{:.3}\" fill=\"{}\" />",
+            c.x,
+            c.y,
+            c.radius,
+            escape_xml(&fill)
+        ));
+        for _ in rest {
+            svg.push_str("</g>");
+        }
+    }
+
+    for label in &venn.labels {
+        let key = label.sets.join("|");
+        let color = style(&key, "color").unwrap_or_else(|| {
+            match (
+                label.sets.len(),
+                venn.circles.iter().find(|c| label.sets == [c.set.clone()]),
+            ) {
+                (1, Some(circle)) => shade(&base_of(circle)),
+                _ => theme.text_color.clone(),
+            }
+        });
+        svg.push_str(&format!(
+            "<text class=\"venn-label\" x=\"{:.3}\" y=\"{:.3}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>",
+            label.x,
+            label.y,
+            font,
+            LABEL_FONT_SIZE,
+            escape_xml(&color),
+            escape_xml(&label.text)
+        ));
+    }
+
+    for text in &venn.texts {
+        let color = style(&text.id, "color").unwrap_or_else(|| theme.text_color.clone());
+        let line_h = TEXT_FONT_SIZE * 1.2;
+        let first = text.y - line_h * (text.lines.lines.len() as f32 - 1.0) / 2.0;
+        for (k, line) in text.lines.lines.iter().enumerate() {
+            svg.push_str(&format!(
+                "<text class=\"venn-text-node\" x=\"{:.3}\" y=\"{:.3}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>",
+                text.x,
+                first + line_h * k as f32,
+                font,
+                TEXT_FONT_SIZE,
+                escape_xml(&color),
+                escape_xml(line)
+            ));
+        }
+    }
     svg
 }
 
