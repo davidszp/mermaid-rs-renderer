@@ -422,7 +422,7 @@ fn mds(radii: &[f32], overlap: &[Vec<f32>], members: &[usize]) -> Option<Vec<(f3
         .map(|r| r.iter().sum::<f64>() / n as f64)
         .collect();
     let all = row.iter().sum::<f64>() / n as f64;
-    let b: Vec<Vec<f64>> = (0..n)
+    let mut b: Vec<Vec<f64>> = (0..n)
         .map(|i| {
             (0..n)
                 .map(|j| -0.5 * (d2[i][j] - row[i] - row[j] + all))
@@ -430,7 +430,6 @@ fn mds(radii: &[f32], overlap: &[Vec<f32>], members: &[usize]) -> Option<Vec<(f3
         })
         .collect();
     // The two largest eigenpairs, by power iteration with deflation.
-    let mut b = b;
     let mut coords = vec![(0.0f32, 0.0f32); n];
     for axis in 0..2 {
         let mut v: Vec<f64> = (0..n)
@@ -571,26 +570,22 @@ fn fit(pos: &mut [(f32, f32)], radii: &[f32], title_h: f32) -> f32 {
     if pos.is_empty() {
         return 1.0;
     }
-    let min_x = pos
-        .iter()
-        .zip(radii)
-        .map(|(p, r)| p.0 - r)
-        .fold(f32::INFINITY, f32::min);
-    let max_x = pos
-        .iter()
-        .zip(radii)
-        .map(|(p, r)| p.0 + r)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let min_y = pos
-        .iter()
-        .zip(radii)
-        .map(|(p, r)| p.1 - r)
-        .fold(f32::INFINITY, f32::min);
-    let max_y = pos
-        .iter()
-        .zip(radii)
-        .map(|(p, r)| p.1 + r)
-        .fold(f32::NEG_INFINITY, f32::max);
+    let (min_x, max_x, min_y, max_y) = pos.iter().zip(radii).fold(
+        (
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ),
+        |(x0, x1, y0, y1), (p, r)| {
+            (
+                x0.min(p.0 - r),
+                x1.max(p.0 + r),
+                y0.min(p.1 - r),
+                y1.max(p.1 + r),
+            )
+        },
+    );
     let (w, h) = ((max_x - min_x).max(1e-6), (max_y - min_y).max(1e-6));
     let avail_w = WIDTH - 2.0 * PADDING;
     let avail_h = HEIGHT - title_h - 2.0 * PADDING;
@@ -603,70 +598,89 @@ fn fit(pos: &mut [(f32, f32)], radii: &[f32], title_h: f32) -> f32 {
     scale
 }
 
-/// The point deepest inside the region of `sets`: inside each of them,
-/// outside every other circle. Falls back to the point deepest inside `sets`
-/// alone when the region is empty.
-pub(crate) fn region_centre(circles: &[VennCircleLayout], sets: &[String]) -> Option<(f32, f32)> {
-    let inside: Vec<&VennCircleLayout> = circles.iter().filter(|c| sets.contains(&c.set)).collect();
-    if inside.is_empty() {
-        return None;
+/// The region of `sets`: inside each of their circles, outside every other.
+struct Region<'a> {
+    inside: Vec<&'a VennCircleLayout>,
+    outside: Vec<&'a VennCircleLayout>,
+}
+
+impl<'a> Region<'a> {
+    fn new(circles: &'a [VennCircleLayout], sets: &[String]) -> Self {
+        let (inside, outside) = circles.iter().partition(|c| sets.contains(&c.set));
+        Self { inside, outside }
     }
-    let outside: Vec<&VennCircleLayout> =
-        circles.iter().filter(|c| !sets.contains(&c.set)).collect();
-    let margin = |p: (f32, f32), with_outside: bool| -> f32 {
+
+    /// How deep `p` lies in the inner circles and, if `exclusive`, clear of
+    /// the others too. Negative outside the region.
+    fn depth(&self, p: (f32, f32), exclusive: bool) -> f32 {
         let dist = |c: &VennCircleLayout| ((p.0 - c.x).powi(2) + (p.1 - c.y).powi(2)).sqrt();
-        let mut m = inside
+        let m = self
+            .inside
             .iter()
             .map(|c| c.radius - dist(c))
             .fold(f32::INFINITY, f32::min);
-        if with_outside {
-            m = outside.iter().map(|c| dist(c) - c.radius).fold(m, f32::min);
+        if !exclusive {
+            return m;
         }
-        m
-    };
-    // The bounding box of the intersection of the inner circles.
-    let x0 = inside
-        .iter()
-        .map(|c| c.x - c.radius)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let x1 = inside
-        .iter()
-        .map(|c| c.x + c.radius)
-        .fold(f32::INFINITY, f32::min);
-    let y0 = inside
-        .iter()
-        .map(|c| c.y - c.radius)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let y1 = inside
-        .iter()
-        .map(|c| c.y + c.radius)
-        .fold(f32::INFINITY, f32::min);
-    if x1 < x0 || y1 < y0 {
-        return None;
+        self.outside
+            .iter()
+            .map(|c| dist(c) - c.radius)
+            .fold(m, f32::min)
     }
-    for with_outside in [true, false] {
+
+    /// The bounding box `(x0, x1, y0, y1)` of the inner circles' intersection.
+    fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        if self.inside.is_empty() {
+            return None;
+        }
+        let edge = |f: fn(&VennCircleLayout) -> f32, max: bool| {
+            let values = self.inside.iter().map(|c| f(c));
+            if max {
+                values.fold(f32::NEG_INFINITY, f32::max)
+            } else {
+                values.fold(f32::INFINITY, f32::min)
+            }
+        };
+        let x0 = edge(|c| c.x - c.radius, true);
+        let x1 = edge(|c| c.x + c.radius, false);
+        let y0 = edge(|c| c.y - c.radius, true);
+        let y1 = edge(|c| c.y + c.radius, false);
+        (x1 >= x0 && y1 >= y0).then_some((x0, x1, y0, y1))
+    }
+}
+
+/// `steps + 1` × `steps + 1` points spanning the box `(x0, x1, y0, y1)`.
+fn grid((x0, x1, y0, y1): (f32, f32, f32, f32), steps: usize) -> impl Iterator<Item = (f32, f32)> {
+    (0..=steps).flat_map(move |i| {
+        (0..=steps).map(move |j| {
+            (
+                x0 + (x1 - x0) * i as f32 / steps as f32,
+                y0 + (y1 - y0) * j as f32 / steps as f32,
+            )
+        })
+    })
+}
+
+/// The point deepest inside the region of `sets`, found on a grid refined
+/// four times around the best point. Falls back to the point deepest inside
+/// `sets` alone when the region is empty.
+fn region_centre(circles: &[VennCircleLayout], sets: &[String]) -> Option<(f32, f32)> {
+    let region = Region::new(circles, sets);
+    let (x0, x1, y0, y1) = region.bounds()?;
+    for exclusive in [true, false] {
         let (mut best, mut best_m) = ((0.5 * (x0 + x1), 0.5 * (y0 + y1)), f32::NEG_INFINITY);
-        let (mut cx0, mut cx1, mut cy0, mut cy1) = (x0, x1, y0, y1);
+        let mut area = (x0, x1, y0, y1);
         for _ in 0..4 {
-            const STEPS: usize = 32;
-            for i in 0..=STEPS {
-                for j in 0..=STEPS {
-                    let p = (
-                        cx0 + (cx1 - cx0) * i as f32 / STEPS as f32,
-                        cy0 + (cy1 - cy0) * j as f32 / STEPS as f32,
-                    );
-                    let m = margin(p, with_outside);
-                    if m > best_m + 1e-4 {
-                        best = p;
-                        best_m = m;
-                    }
+            for p in grid(area, 32) {
+                let m = region.depth(p, exclusive);
+                if m > best_m + 1e-4 {
+                    (best, best_m) = (p, m);
                 }
             }
-            // Zoom in around the best point found.
-            let (hw, hh) = ((cx1 - cx0) / 8.0, (cy1 - cy0) / 8.0);
-            (cx0, cx1, cy0, cy1) = (best.0 - hw, best.0 + hw, best.1 - hh, best.1 + hh);
+            let (hw, hh) = ((area.1 - area.0) / 8.0, (area.3 - area.2) / 8.0);
+            area = (best.0 - hw, best.0 + hw, best.1 - hh, best.1 + hh);
         }
-        if best_m > 0.0 || !with_outside {
+        if best_m > 0.0 || !exclusive {
             return Some(best);
         }
     }
@@ -675,9 +689,7 @@ pub(crate) fn region_centre(circles: &[VennCircleLayout], sets: &[String]) -> Op
 
 /// Where a label `size` (width, height) goes in the region of `sets`: of the
 /// points inside the region, the one whose box overlaps the `placed` boxes
-/// least, the deepest among equals. The region's centre when nothing inside it
-/// is free of overlap is still the least-overlapping point; when the region is
-/// empty, `region_centre`'s fallback.
+/// least, the deepest among equals; the region's centre when none beats it.
 fn place_label(
     circles: &[VennCircleLayout],
     sets: &[String],
@@ -688,17 +700,7 @@ fn place_label(
     if placed.is_empty() {
         return Some(centre);
     }
-    let inside: Vec<&VennCircleLayout> = circles.iter().filter(|c| sets.contains(&c.set)).collect();
-    let outside: Vec<&VennCircleLayout> =
-        circles.iter().filter(|c| !sets.contains(&c.set)).collect();
-    let margin = |p: (f32, f32)| -> f32 {
-        let dist = |c: &VennCircleLayout| ((p.0 - c.x).powi(2) + (p.1 - c.y).powi(2)).sqrt();
-        let m = inside
-            .iter()
-            .map(|c| c.radius - dist(c))
-            .fold(f32::INFINITY, f32::min);
-        outside.iter().map(|c| dist(c) - c.radius).fold(m, f32::min)
-    };
+    let region = Region::new(circles, sets);
     let overlap = |p: (f32, f32)| -> f32 {
         let (x0, y0) = (p.0 - size.0 / 2.0, p.1 - size.1 / 2.0);
         placed
@@ -710,38 +712,15 @@ fn place_label(
             })
             .sum()
     };
-    let x0 = inside
-        .iter()
-        .map(|c| c.x - c.radius)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let x1 = inside
-        .iter()
-        .map(|c| c.x + c.radius)
-        .fold(f32::INFINITY, f32::min);
-    let y0 = inside
-        .iter()
-        .map(|c| c.y - c.radius)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let y1 = inside
-        .iter()
-        .map(|c| c.y + c.radius)
-        .fold(f32::INFINITY, f32::min);
-    let mut best = (overlap(centre), -margin(centre), centre);
-    const STEPS: usize = 48;
-    for i in 0..=STEPS {
-        for j in 0..=STEPS {
-            let p = (
-                x0 + (x1 - x0) * i as f32 / STEPS as f32,
-                y0 + (y1 - y0) * j as f32 / STEPS as f32,
-            );
-            let m = margin(p);
-            if m <= 0.0 {
-                continue;
-            }
-            let candidate = (overlap(p), -m, p);
-            if candidate.0 < best.0 - 0.5 || (candidate.0 <= best.0 + 0.5 && candidate.1 < best.1) {
-                best = candidate;
-            }
+    let mut best = (overlap(centre), -region.depth(centre, true), centre);
+    for p in grid(region.bounds()?, 48) {
+        let m = region.depth(p, true);
+        if m <= 0.0 {
+            continue;
+        }
+        let candidate = (overlap(p), -m, p);
+        if candidate.0 < best.0 - 0.5 || (candidate.0 <= best.0 + 0.5 && candidate.1 < best.1) {
+            best = candidate;
         }
     }
     Some(best.2)
@@ -769,24 +748,19 @@ fn text_items(
         let Some((cx, cy)) = at.or_else(|| region_centre(circles, &sets)) else {
             continue;
         };
-        let inside: Vec<&VennCircleLayout> =
-            circles.iter().filter(|c| sets.contains(&c.set)).collect();
-        let min_r = inside
+        let region = Region::new(circles, &sets);
+        let min_r = region
+            .inside
             .iter()
             .map(|c| c.radius)
             .fold(f32::INFINITY, f32::min);
-        let mut inner = inside
-            .iter()
-            .map(|c| c.radius - ((cx - c.x).powi(2) + (cy - c.y).powi(2)).sqrt())
-            .fold(f32::INFINITY, f32::min)
-            .max(0.0);
+        let mut inner = region.depth((cx, cy), false).max(0.0);
         if inner == 0.0 && min_r.is_finite() {
             inner = min_r * 0.6;
         }
         let inner_w = (80.0 * SCALE).max(inner * 2.0 * 0.95);
         let inner_h = (60.0 * SCALE).max(inner * 2.0 * 0.95);
-        let has_label = labels.iter().any(|l| l.sets == sets);
-        let label_offset = if has_label {
+        let label_offset = if at.is_some() {
             (32.0 * SCALE).min(inner * 0.25)
         } else {
             0.0

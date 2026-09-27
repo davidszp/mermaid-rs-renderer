@@ -2374,17 +2374,8 @@ fn render_error(layout: &ErrorLayout, _theme: &Theme, _config: &LayoutConfig) ->
 /// colour that does not parse falls back to the pie palette.
 fn venn_palette(theme: &Theme, dark: bool) -> Vec<String> {
     let adjust = |color: &str, dh: f32, dl: f32, fallback: usize| -> String {
-        match crate::theme::parse_color_to_hsl(color) {
-            Some((h, s, l)) => {
-                let l = if dark {
-                    (l - dl).clamp(0.0, 100.0)
-                } else {
-                    (l + dl).clamp(0.0, 100.0)
-                };
-                format!("hsl({:.1}, {s:.1}%, {l:.1}%)", (h + dh).rem_euclid(360.0))
-            }
-            None => theme.pie_colors[fallback % theme.pie_colors.len()].clone(),
-        }
+        venn_shift(color, dh, dl, dark)
+            .unwrap_or_else(|| theme.pie_colors[fallback % theme.pie_colors.len()].clone())
     };
     let (p, s, t) = (
         &theme.primary_color,
@@ -2392,15 +2383,26 @@ fn venn_palette(theme: &Theme, dark: bool) -> Vec<String> {
         &theme.tertiary_color,
     );
     vec![
-        adjust(p, 0.0, -30.0, 0),
-        adjust(s, 0.0, -30.0, 1),
-        adjust(t, 0.0, -40.0, 2),
-        adjust(p, 60.0, -30.0, 3),
-        adjust(p, -60.0, -30.0, 4),
-        adjust(s, 60.0, -30.0, 5),
-        adjust(p, 120.0, -30.0, 6),
-        adjust(s, 120.0, -30.0, 7),
+        adjust(p, 0.0, 30.0, 0),
+        adjust(s, 0.0, 30.0, 1),
+        adjust(t, 0.0, 40.0, 2),
+        adjust(p, 60.0, 30.0, 3),
+        adjust(p, -60.0, 30.0, 4),
+        adjust(s, 60.0, 30.0, 5),
+        adjust(p, 120.0, 30.0, 6),
+        adjust(s, 120.0, 30.0, 7),
     ]
+}
+
+/// `color` turned `dh` degrees and made `dl` points darker, or lighter on a
+/// dark background.
+fn venn_shift(color: &str, dh: f32, dl: f32, dark: bool) -> Option<String> {
+    let (h, s, l) = crate::theme::parse_color_to_hsl(color)?;
+    let l = if dark { l + dl } else { l - dl }.clamp(0.0, 100.0);
+    Some(format!(
+        "hsl({:.1}, {s:.1}%, {l:.1}%)",
+        (h + dh).rem_euclid(360.0)
+    ))
 }
 
 /// A Venn diagram, drawn as mermaid.js's default look draws it: each set a
@@ -2425,36 +2427,35 @@ fn render_venn(layout: &Layout, theme: &Theme) -> String {
     };
     let dark =
         crate::theme::parse_color_to_hsl(&theme.background).is_some_and(|(_, _, l)| l < 50.0);
-    let shade = |color: &str| -> String {
-        match crate::theme::parse_color_to_hsl(color) {
-            Some((h, s, l)) => {
-                let l = if dark {
-                    (l + 30.0).min(100.0)
-                } else {
-                    (l - 30.0).max(0.0)
-                };
-                format!("hsl({h:.1}, {s:.1}%, {l:.1}%)")
-            }
-            None => theme.text_color.clone(),
-        }
-    };
+    let shade = |color: &str| venn_shift(color, 0.0, 30.0, dark);
     let font = normalize_font_family(&theme.font_family);
     let palette = venn_palette(theme, dark);
     let base_of = |circle: &crate::layout::VennCircleLayout| -> String {
         style(&circle.set, "fill")
             .unwrap_or_else(|| palette[circle.color_index % palette.len()].clone())
     };
+    let text = |class: &str, x: f32, y: f32, size: f32, color: &str, content: &str| {
+        format!(
+            "<text class=\"{}\" x=\"{:.3}\" y=\"{:.3}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>",
+            class,
+            x,
+            y,
+            font,
+            size,
+            escape_xml(color),
+            escape_xml(content)
+        )
+    };
     let mut svg = String::new();
 
     if let Some(title) = &venn.title {
-        svg.push_str(&format!(
-            "<text class=\"venn-title\" x=\"{:.3}\" y=\"{:.3}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>",
+        svg.push_str(&text(
+            "venn-title",
             WIDTH / 2.0,
             TITLE_FONT_SIZE,
-            font,
             TITLE_FONT_SIZE,
-            escape_xml(&theme.text_color),
-            escape_xml(title)
+            &theme.text_color,
+            title,
         ));
     }
 
@@ -2520,39 +2521,37 @@ fn render_venn(layout: &Layout, theme: &Theme) -> String {
 
     for label in &venn.labels {
         let key = label.sets.join("|");
-        let color = style(&key, "color").unwrap_or_else(|| {
-            match (
-                label.sets.len(),
-                venn.circles.iter().find(|c| label.sets == [c.set.clone()]),
-            ) {
-                (1, Some(circle)) => shade(&base_of(circle)),
-                _ => theme.text_color.clone(),
-            }
-        });
-        svg.push_str(&format!(
-            "<text class=\"venn-label\" x=\"{:.3}\" y=\"{:.3}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>",
+        let color = style(&key, "color")
+            .or_else(|| {
+                let circle = venn
+                    .circles
+                    .iter()
+                    .find(|c| label.sets == [c.set.clone()])?;
+                shade(&base_of(circle))
+            })
+            .unwrap_or_else(|| theme.text_color.clone());
+        svg.push_str(&text(
+            "venn-label",
             label.x,
             label.y,
-            font,
             LABEL_FONT_SIZE,
-            escape_xml(&color),
-            escape_xml(&label.text)
+            &color,
+            &label.text,
         ));
     }
 
-    for text in &venn.texts {
-        let color = style(&text.id, "color").unwrap_or_else(|| theme.text_color.clone());
+    for item in &venn.texts {
+        let color = style(&item.id, "color").unwrap_or_else(|| theme.text_color.clone());
         let line_h = TEXT_FONT_SIZE * 1.2;
-        let first = text.y - line_h * (text.lines.lines.len() as f32 - 1.0) / 2.0;
-        for (k, line) in text.lines.lines.iter().enumerate() {
-            svg.push_str(&format!(
-                "<text class=\"venn-text-node\" x=\"{:.3}\" y=\"{:.3}\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-family=\"{}\" font-size=\"{}\" fill=\"{}\">{}</text>",
-                text.x,
+        let first = item.y - line_h * (item.lines.lines.len() as f32 - 1.0) / 2.0;
+        for (k, line) in item.lines.lines.iter().enumerate() {
+            svg.push_str(&text(
+                "venn-text-node",
+                item.x,
                 first + line_h * k as f32,
-                font,
                 TEXT_FONT_SIZE,
-                escape_xml(&color),
-                escape_xml(line)
+                &color,
+                line,
             ));
         }
     }
