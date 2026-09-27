@@ -2210,12 +2210,16 @@ fn render_error(layout: &ErrorLayout, _theme: &Theme, _config: &LayoutConfig) ->
     svg
 }
 
-/// mermaid.js's `venn1`…`venn8`, as its default, base and forest themes derive
-/// them: the primary, secondary and tertiary colours 30 points darker (the
-/// tertiary 40), then the primary and secondary turned by 60 and 120 degrees.
-/// On a dark background they are lightened instead, as the dark theme does. A
-/// colour that does not parse falls back to the pie palette.
+/// mermaid.js's `venn1`…`venn8`: the theme's own when it sets them, otherwise
+/// as its default, base and forest themes derive them: the primary, secondary
+/// and tertiary colours 30 points darker (the tertiary 40), then the primary
+/// and secondary turned by 60 and 120 degrees. On a dark background they are
+/// lightened instead, as the dark theme does. A colour that does not parse
+/// falls back to the pie palette.
 fn venn_palette(theme: &Theme, dark: bool) -> Vec<String> {
+    if !theme.venn_colors.is_empty() {
+        return theme.venn_colors.clone();
+    }
     let adjust = |color: &str, dh: f32, dl: f32, fallback: usize| -> String {
         venn_shift(color, dh, dl, dark)
             .unwrap_or_else(|| theme.pie_colors[fallback % theme.pie_colors.len()].clone())
@@ -2268,8 +2272,13 @@ fn render_venn(layout: &Layout, theme: &Theme) -> String {
             .rfind(|(k, _)| k == prop)
             .map(|(_, v)| v.clone())
     };
-    let dark =
-        crate::theme::parse_color_to_hsl(&theme.background).is_some_and(|(_, _, l)| l < 50.0);
+    // A background that is not a colour (`none`, for a page showing through)
+    // is judged by the text instead: light text means a dark page.
+    let lightness = |c: &str| crate::theme::parse_color_to_hsl(c).map(|(_, _, l)| l);
+    let dark = match lightness(&theme.background) {
+        Some(l) => l < 50.0,
+        None => lightness(&theme.text_color).is_some_and(|l| l > 50.0),
+    };
     let shade = |color: &str| venn_shift(color, 0.0, 30.0, dark);
     let font = normalize_font_family(&theme.font_family);
     let palette = venn_palette(theme, dark);
@@ -6549,6 +6558,22 @@ mod tests {
     use crate::config::LayoutConfig;
     use crate::ir::{Direction, Graph};
     use crate::layout::compute_layout;
+
+    #[test]
+    fn venn_takes_the_theme_palette_and_reads_a_transparent_page_by_its_text() {
+        let input = "venn-beta\n  set A\n  set B\n  union A,B\n";
+        let config = LayoutConfig::default();
+        let parsed = crate::parser::parse_mermaid(input).expect("venn parses");
+        let mut theme = Theme::modern();
+        theme.venn_colors = vec!["#336699".into(), "#993366".into()];
+        theme.background = "none".into();
+        theme.text_color = "#eeeeee".into();
+        let layout = compute_layout(&parsed.graph, &theme, &config);
+        let svg = render_svg(&layout, &theme, &config);
+        assert!(svg.contains("fill=\"#336699\"") && svg.contains("fill=\"#993366\""));
+        // Set labels lightened, as on a dark page: #336699 is 40% light.
+        assert!(svg.contains("fill=\"hsl(210.0, 50.0%, 70.0%)\""), "{svg}");
+    }
 
     #[test]
     fn render_svg_basic() {
